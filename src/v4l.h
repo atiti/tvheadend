@@ -22,6 +22,18 @@
 #define __user
 #include <linux/videodev2.h>
 
+
+typedef enum {
+        IO_METHOD_READ,
+        IO_METHOD_MMAP,
+        IO_METHOD_USERPTR,
+} io_method;
+
+struct buffer {
+	void *start;
+	size_t length;
+};
+
 LIST_HEAD(v4l_adapter_list, v4l_adapter);
 TAILQ_HEAD(v4l_adapter_queue, v4l_adapter);
 
@@ -44,6 +56,16 @@ typedef struct v4l_adapter {
 
   uint32_t va_logging;
 
+  int va_can_mpeg;
+
+  int va_frame_size;
+
+  unsigned int n_buffers;
+
+  struct buffer *buffers;
+ 
+  io_method io;
+
   //  struct v4l2_capability va_caps;
 
   struct service *va_current_service;
@@ -58,6 +80,7 @@ typedef struct v4l_adapter {
   pthread_t va_thread;
 
   int va_pipe[2];
+
 
   /** Mpeg stream parsing */
   uint32_t va_startcode;

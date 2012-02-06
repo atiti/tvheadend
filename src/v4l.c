@@ -22,6 +22,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <stdio.h>
@@ -41,10 +42,22 @@
 #include "psi.h"
 #include "channels.h"
 
+#define CLEAR(x) memset (&(x), 0, sizeof (x))
+
 struct v4l_adapter_queue v4l_adapters;
 
 static void v4l_adapter_notify(v4l_adapter_t *va);
 
+
+static int xioctl(int fd, int request, void* argp)
+{
+  int r;
+
+  do r = ioctl(fd, request, argp);
+  while (-1 == r && EINTR == errno);
+
+  return r;
+}
 
 /**
  *
@@ -54,13 +67,65 @@ v4l_input(v4l_adapter_t *va)
 {
   service_t *t = va->va_current_service;
   elementary_stream_t *st;
-  uint8_t buf[4000];
+  struct v4l2_buffer vbuf;
+  uint8_t *buf = NULL;
   uint8_t *ptr, *pkt;
-  int len, l, r;
+  int len=0, l, r;
 
-  len = read(va->va_fd, buf, 4000);
-  if(len < 1)
-    return;
+
+//#ifdef ENABLE_LIBAVCODEC
+  if (!va->va_can_mpeg) {
+//#else
+//  if (0) {
+//#endif
+    tvhlog(LOG_DEBUG, "v4l", "IO: %d", va->io);
+    switch(va->io) {
+	case IO_METHOD_READ:
+    		buf = (uint8_t *)malloc(va->va_frame_size);
+    		len = read(va->va_fd, buf, va->va_frame_size);
+     		break;
+	case IO_METHOD_MMAP:
+		CLEAR(vbuf);
+		vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		vbuf.memory = V4L2_MEMORY_MMAP;
+		
+		if (-1 == xioctl(va->va_fd, VIDIOC_DQBUF, &vbuf)) {
+			switch(errno) {
+				case EAGAIN:
+					//tvhlog(LOG_ERR, "v4l", "EAGAIN");
+					return;
+				case EIO:
+				default:
+					tvhlog(LOG_ERR, "v4l", "VIDIOC_DQBUF: %s (%d)", strerror(errno), errno);
+					return;
+			}
+		}
+
+		assert(vbuf.index < va->n_buffers);
+
+		len = va->buffers[vbuf.index].length;
+		buf = va->buffers[vbuf.index].start;
+		tvhlog(LOG_DEBUG, "v4l", "v4l2 memory mapped thingy");
+		break;
+	case IO_METHOD_USERPTR:
+		break;
+    }
+  //  tvhlog(LOG_DEBUG, "v4l", "v4l2 frame size: %d len: %d", va->va_frame_size, len);
+  } else {
+    buf = (uint8_t *)malloc(4000);
+
+    len = read(va->va_fd, buf, 4000);
+  }
+  tvhlog(LOG_DEBUG, "v4l", "curlen: %d", len); 
+  if(len < 1) {
+      tvhlog(LOG_DEBUG, "v4l", "Errno: %s (%d)", strerror(errno), errno);
+      free(buf);
+      return;
+  }
+
+  tvhlog(LOG_DEBUG, "v4l", "Read %d bytes", len);
+  goto theend;
+
 
   ptr = buf;
 
@@ -70,6 +135,7 @@ v4l_input(v4l_adapter_t *va)
 				       TSS_INPUT_HARDWARE | TSS_INPUT_SERVICE);
 
   while(len > 0) {
+    tvhlog(LOG_INFO, "v4l", "Can MPEG: %d", va->va_can_mpeg);
 
     switch(va->va_startcode) {
     default:
@@ -121,7 +187,21 @@ v4l_input(v4l_adapter_t *va)
       ptr++; len--;
     }
   }
+
   pthread_mutex_unlock(&t->s_stream_mutex);
+theend:
+  switch(va->io) {
+	case IO_METHOD_READ:
+		free(buf);
+		break;
+	case IO_METHOD_MMAP:
+		if (-1 == xioctl(va->va_fd, VIDIOC_QBUF, &vbuf)) {
+			tvhlog(LOG_ERR, "v4l", "VIDIOC_QBUF failed");
+		}
+		break;
+	default:
+		break;
+  }
 }
 
 
@@ -132,30 +212,36 @@ static void *
 v4l_thread(void *aux)
 {
   v4l_adapter_t *va = aux;
-  struct pollfd pfd[2];
+  fd_set fds;
+  struct timeval tv;
   int r;
 
-  pfd[0].fd = va->va_pipe[0];
-  pfd[0].events = POLLIN;
-  pfd[1].fd = va->va_fd;
-  pfd[1].events = POLLIN;
-
   while(1) {
+    FD_ZERO(&fds);
+    FD_SET(va->va_pipe[0], &fds);
+    FD_SET(va->va_fd, &fds);
 
-    r = poll(pfd, 2, -1);
-    if(r < 0) {
-      tvhlog(LOG_ALERT, "v4l", "%s: poll() error %s, sleeping one second",
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+
+    r = select(va->va_fd + 1, &fds, NULL, NULL, &tv);
+    if(r <= 0) {
+      if (EINTR == errno)
+        continue;
+
+      if (r == -1) {
+        tvhlog(LOG_ALERT, "v4l", "%s: select() error %s, exiting",
 	     va->va_path, strerror(errno));
-      sleep(1);
-      continue;
+        break;
+      }
     }
 
-    if(pfd[0].revents & POLLIN) {
+    if (FD_ISSET(va->va_pipe[0], &fds)) { //(pfd[0].revents & POLLIN) {
       // Message on control pipe, used to exit thread, do so
       break;
     }
 
-    if(pfd[1].revents & POLLIN) {
+    if (FD_ISSET(va->va_fd, &fds)) { //(pfd[1].revents & POLLIN) { // || va->io == IO_METHOD_MMAP) {
       v4l_input(va);
     }
   }
@@ -175,9 +261,17 @@ v4l_service_start(service_t *t, unsigned int weight, int force_start)
   v4l_adapter_t *va = t->s_v4l_adapter;
   int frequency = t->s_v4l_frequency;
   struct v4l2_frequency vf;
+  struct v4l2_format fmt;
+  struct v4l2_input input;
+  struct v4l2_requestbuffers req;
+  enum v4l2_buf_type type;
   int result;
   v4l2_std_id std = 0xff;
-  int fd;
+  int fd,min;
+  char buff[10];
+  int width=640,height=480;
+
+  va->io = IO_METHOD_MMAP;
 
   if(va->va_current_service != NULL)
     return 1; // Adapter busy
@@ -192,7 +286,7 @@ v4l_service_start(service_t *t, unsigned int weight, int force_start)
 
   if(!va->va_file) {
 
-    result = ioctl(fd, VIDIOC_S_STD, &std);
+    result = xioctl(fd, VIDIOC_S_STD, &std);
     if(result < 0) {
       tvhlog(LOG_ERR, "v4l",
 	     "%s: Unable to set PAL -- %s", va->va_path, strerror(errno));
@@ -205,7 +299,7 @@ v4l_service_start(service_t *t, unsigned int weight, int force_start)
     vf.tuner = 0;
     vf.type = V4L2_TUNER_ANALOG_TV;
     vf.frequency = (frequency * 16) / 1000000;
-    result = ioctl(fd, VIDIOC_S_FREQUENCY, &vf);
+    result = xioctl(fd, VIDIOC_S_FREQUENCY, &vf);
     if(result < 0) {
       tvhlog(LOG_ERR, "v4l",
 	     "%s: Unable to tune to %dHz", va->va_path, frequency);
@@ -221,6 +315,125 @@ v4l_service_start(service_t *t, unsigned int weight, int force_start)
 	   "%s: Unable to create control pipe", va->va_path, strerror(errno));
     close(fd);
     return -1;
+  }
+
+  if (!va->va_can_mpeg) {
+    CLEAR(fmt);
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = width;
+    fmt.fmt.pix.height = height;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+    fmt.fmt.pix.field = V4L2_FIELD_INTERLACED;
+
+    if (-1 == xioctl(fd, VIDIOC_S_FMT, &fmt)) {
+       tvhlog(LOG_ERR, "v4l", "Unable to set format to YUYV");
+    }
+    if (width != fmt.fmt.pix.width) {
+	width = fmt.fmt.pix.width;
+	tvhlog(LOG_WARNING, "v4l", "Image width set to %d by device", width);
+    }
+    if (height != fmt.fmt.pix.height) {
+ 	height = fmt.fmt.pix.height;
+	tvhlog(LOG_WARNING, "v4l", "Image height set to %d by device", height);
+    }
+    /* buggy driver paranoia */
+    min = fmt.fmt.pix.width * 2;
+    if (fmt.fmt.pix.bytesperline < min)
+	fmt.fmt.pix.bytesperline = min;
+    min = fmt.fmt.pix.bytesperline * fmt.fmt.pix.height;
+    if (fmt.fmt.pix.sizeimage < min)
+   	fmt.fmt.pix.sizeimage = min;
+    va->va_frame_size = fmt.fmt.pix.sizeimage;
+
+    int index = 0;
+    if (-1 == xioctl(fd, VIDIOC_S_INPUT, &index)) {
+	tvhlog(LOG_ERR, "v4l", "Failed to set input to 0");
+    }
+    if (-1 == xioctl(fd, VIDIOC_G_INPUT, &index)) {
+        tvhlog(LOG_ERR, "v4l", "Failed to get input selection");
+    }
+    CLEAR(input);
+    input.index = index;
+    if (-1 == xioctl(fd, VIDIOC_ENUMINPUT, &input)) {
+        tvhlog(LOG_ERR, "v4l", "Failed to get input details");
+    }
+    tvhlog(LOG_DEBUG, "v4l", "Selected input: %d (%s)", index, input.name);
+   
+    switch(va->io) {
+	case IO_METHOD_READ:
+	case IO_METHOD_USERPTR:
+		break;
+	case IO_METHOD_MMAP:
+		CLEAR(req);
+		req.count = 4;
+		req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		req.memory = V4L2_MEMORY_MMAP;
+		if (-1 == xioctl(fd, VIDIOC_REQBUFS, &req)) {
+			if (EINVAL == errno)
+				tvhlog(LOG_ERR, "v4l", "device does not support memory mapping");
+			else {
+				tvhlog(LOG_ERR, "v4l", "VIDIOC_REQBUFS failed");
+				close(fd);
+				return -1;
+			}
+		}
+
+		if (req.count < 2) {
+			tvhlog(LOG_ERR, "v4l", "Insufficient buffer memory");
+			close(fd);
+			return -1;
+		}
+
+		va->buffers = calloc(req.count, sizeof(*va->buffers));
+		if (!va->buffers) {
+			tvhlog(LOG_ERR, "v4l", "Out of memory");
+			close(fd);
+			return -1;
+		}
+		
+		for(va->n_buffers = 0;va->n_buffers < req.count;++va->n_buffers) {
+			struct v4l2_buffer buf;
+			CLEAR(buf);
+			buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+			buf.memory = V4L2_MEMORY_MMAP;
+			buf.index = va->n_buffers;
+			if (-1 == xioctl(fd, VIDIOC_QUERYBUF, &buf)) {
+				tvhlog(LOG_ERR, "v4l", "Failed to VIDEOC_QUERYBUF");
+				close(fd);
+				return -1;
+			}
+			va->buffers[va->n_buffers].length = buf.length;
+			va->buffers[va->n_buffers].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
+			if (MAP_FAILED == va->buffers[va->n_buffers].start) { 
+				tvhlog(LOG_ERR, "v4l", "mmap failed");
+				close(fd);
+				return -1;
+			}
+			CLEAR(buf);
+			buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+			buf.memory = V4L2_MEMORY_MMAP;
+			buf.index = va->n_buffers;
+
+			if (-1 == xioctl(fd, VIDIOC_QBUF, &buf)) {
+                        	tvhlog(LOG_ERR, "v4l", "VIDIOC_QBUF failed");
+				close(fd);
+				return -1;
+            		}
+		}
+		type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		if (-1 == xioctl(fd, VIDIOC_STREAMON, &type)) {
+			tvhlog(LOG_ERR, "v4l", "Failed to set streaming on");
+			close(fd);
+			return -1;
+		}
+
+		tvhlog(LOG_DEBUG, "v4l", "INPUT_MMAP initialized");
+		break;
+    }
+
+    /* Start capture by reading 0 bytes from device */
+    result = read(fd, buff, 0);
+	
   }
 
 
@@ -249,9 +462,25 @@ static void
 v4l_service_stop(service_t *t)
 {
   char c = 'q';
+  enum v4l2_buf_type type;
+  int i = 0;
   v4l_adapter_t *va = t->s_v4l_adapter;
 
   assert(va->va_current_service != NULL);
+
+  if(va->io == IO_METHOD_MMAP) {
+	for(i=0;i<va->n_buffers;i++) {
+		if (-1 == munmap(va->buffers[i].start, va->buffers[i].length))
+			tvhlog(LOG_ERR, "v4l", "munmap failed");
+	}
+
+	type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	if (-1 == xioctl(va->va_fd, VIDIOC_STREAMOFF, &type)) {
+		tvhlog(LOG_ERR, "v4l", "VIDIOC_STREAMOFF error");
+	}
+
+	tvhlog(LOG_DEBUG, "v4l", "INPUT_MMAP stopped");
+  }
 
   if(write(va->va_pipe[1], &c, 1) != 1)
     tvhlog(LOG_ERR, "v4l", "Unable to close video thread -- %s",
@@ -311,7 +540,7 @@ v4l_service_quality(service_t *t)
 static int
 v4l_grace_period(service_t *t)
 {
-  return 2;
+  return 5;
 }
 
 
@@ -392,7 +621,7 @@ v4l_service_find(v4l_adapter_t *va, const char *id, int create)
  */
 static void
 v4l_adapter_add(const char *path, const char *displayname, 
-		const char *devicename, int file)
+		const char *devicename, int file, int can_mpeg)
 {
   v4l_adapter_t *va;
   int i, r;
@@ -410,6 +639,7 @@ v4l_adapter_add(const char *path, const char *displayname,
   va->va_path = path ? strdup(path) : NULL;
   va->va_devicename = devicename ? strdup(devicename) : NULL;
   va->va_file = file;
+  va->va_can_mpeg = can_mpeg;
 
   TAILQ_INSERT_TAIL(&v4l_adapters, va, va_global_link);
 }
@@ -427,7 +657,7 @@ v4l_adapter_check(const char *path, int fd)
 
   struct v4l2_capability caps;
 
-  r = ioctl(fd, VIDIOC_QUERYCAP, &caps);
+  r = xioctl(fd, VIDIOC_QUERYCAP, &caps);
 
   if(r) {
     tvhlog(LOG_WARNING, "v4l", 
@@ -444,6 +674,12 @@ v4l_adapter_check(const char *path, int fd)
     return;
   }
 
+  if (!(caps.capabilities & V4L2_CAP_READWRITE)) {
+    tvhlog(LOG_WARNING, "v4l", "%s: Device does not support read i/o", path);
+  }
+  if (!(caps.capabilities & V4L2_CAP_STREAMING)) {
+    tvhlog(LOG_WARNING, "v4l", "%s: Device does not support streaming i/o", path);
+  }
   /* Enum video standards */
 
   for(i = 0;; i++) {
@@ -451,7 +687,7 @@ v4l_adapter_check(const char *path, int fd)
     memset(&standard, 0, sizeof(standard));
     standard.index = i;
 
-    if(ioctl(fd, VIDIOC_ENUMSTD, &standard))
+    if(xioctl(fd, VIDIOC_ENUMSTD, &standard))
       break;
 
     tvhlog(LOG_INFO, "v4l", 
@@ -472,7 +708,7 @@ v4l_adapter_check(const char *path, int fd)
     memset(&input, 0, sizeof(input));
     input.index = i;
     
-    if(ioctl(fd, VIDIOC_ENUMINPUT, &input))
+    if(xioctl(fd, VIDIOC_ENUMINPUT, &input))
       break;
 
     const char *type;
@@ -505,7 +741,6 @@ v4l_adapter_check(const char *path, int fd)
 	   f & V4L2_IN_ST_NO_COLOR  ? "[No color] " : "");
   }
 
-
   int can_mpeg = 0;
 
   /* Enum formats */
@@ -516,7 +751,7 @@ v4l_adapter_check(const char *path, int fd)
     fmtdesc.index = i;
     fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
-    if(ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc))
+    if(xioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc))
       break;
 
     tvhlog(LOG_INFO, "v4l", 
@@ -540,16 +775,17 @@ v4l_adapter_check(const char *path, int fd)
 
   if(!can_mpeg) {
     tvhlog(LOG_WARNING, "v4l", 
-	   "%s: Device lacks MPEG encoder, device skipped", path);
-    return;
+	   "%s: Device lacks MPEG encoder, soft encoding needs to be used", path);
   }
+
+
   snprintf(devicename, sizeof(devicename), "%s %s %s",
 	   caps.card, caps.driver, caps.bus_info);
 
   tvhlog(LOG_INFO, "v4l",
 	 "%s: Using adapter", devicename);
 
-  v4l_adapter_add(path, devicename, devicename, 0);
+  v4l_adapter_add(path, devicename, devicename, 0,can_mpeg);
 }
 
 
@@ -771,10 +1007,15 @@ v4l_init(void)
 	va->va_identifier = strdup(f->hmf_name);
 	va->va_path = NULL;
 	va->va_devicename = NULL;
-      }
+
+     }
 
       tvh_str_update(&va->va_displayname, htsmsg_get_str(c, "displayname"));
       htsmsg_get_u32(c, "logging", &va->va_logging);
+
+
+      va->buffers = NULL;
+      va->n_buffers = 0;
     }
     htsmsg_destroy(l);
   }

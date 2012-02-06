@@ -154,6 +154,17 @@ else
     die
 fi
 
+if pkg-config libavcodec; then
+   echo >>${CONFIG_MAK} "LDFLAGS_cfg += " `pkg-config --libs libavcodec`
+   echo >>${CONFIG_MAK} "CFLAGS_cfg += " `pkg-config --cflags libavcodec`
+   echo "Using libavcodec:      `pkg-config --modversion libavcodec`"
+   enable libavcodec
+else
+   echo "libavcodec not found"
+   die
+fi
+
+
 #
 # Configure paths, etc
 #
