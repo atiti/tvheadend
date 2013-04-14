@@ -20,6 +20,11 @@
 #include <limits.h>
 #include <string.h>
 #include <assert.h>
+#include <openssl/md5.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <dirent.h>
+#include <unistd.h>
 #include "tvheadend.h"
 
 /**
@@ -72,7 +77,7 @@ static uint32_t crc_tab[256] = {
 };
 
 uint32_t
-crc32(uint8_t *data, size_t datalen, uint32_t crc)
+tvh_crc32(uint8_t *data, size_t datalen, uint32_t crc)
 {
   while(datalen--)
     crc = (crc << 8) ^ crc_tab[((crc >> 24) ^ *data++) & 0xff];
@@ -116,17 +121,33 @@ rate_to_sri(int rate)
 /**
  *
  */
+#define HEXDUMP_WIDTH 16
 void
 hexdump(const char *pfx, const uint8_t *data, int len)
 {
-  int i;
-  printf("%s: ", pfx);
-  for(i = 0; i < len; i++)
-    printf("%02x.", data[i]);
-  printf("\n");
+  int i, j=0, l;
+  char str[HEXDUMP_WIDTH+1];
+  l = ((len+(HEXDUMP_WIDTH-1))/HEXDUMP_WIDTH)*HEXDUMP_WIDTH;
+  str[0] = 0;
+  for (i = 0; i < l; i++) {
+    if (!j) printf("%s: ", pfx);
+    if (i < len) {
+      printf("%02X ", data[i]);
+      str[j] = data[i];
+      if (str[j] < ' ' || str[j] > '~') str[j] = '.';
+    } else {
+      printf("   ");
+      str[j] = ' ';
+    }
+    j++;
+    if (j == HEXDUMP_WIDTH) {
+      str[j] = 0;
+      printf("%s\n", str);
+      str[0] = 0;
+      j = 0;
+    }
+  }
 }
-
-
 
 /**
  * @file
@@ -305,4 +326,113 @@ sbuf_cut(sbuf_t *sb, int off)
   assert(off <= sb->sb_ptr);
   sb->sb_ptr = sb->sb_ptr - off;
   memmove(sb->sb_data, sb->sb_data + off, sb->sb_ptr);
+}
+
+char *
+md5sum ( const char *str )
+{
+  int i;
+  static unsigned char md5[MD5_DIGEST_LENGTH];
+  char *ret = malloc((MD5_DIGEST_LENGTH * 2) + 1);
+  MD5((const unsigned char*)str, strlen(str), md5);
+  for ( i = 0; i < MD5_DIGEST_LENGTH; i++ ) {
+    sprintf(&ret[i*2], "%02X", md5[i]);
+  }
+  ret[MD5_DIGEST_LENGTH*2] = '\0';
+  return ret;
+}
+
+int
+makedirs ( const char *inpath, int mode )
+{
+  int err, ok;
+  size_t x;
+  struct stat st;
+  char path[512];
+
+  if (!inpath || !*inpath) return -1;
+
+  x  = 1;
+  ok = 1;
+  strcpy(path, inpath);
+  while(ok) {
+    ok = path[x];
+    if (path[x] == '/' || !path[x]) {
+      path[x] = 0;
+      if (stat(path, &st)) {
+        err = mkdir(path, mode);
+      } else {
+        err   = S_ISDIR(st.st_mode) ? 0 : 1;
+        errno = ENOTDIR;
+      }
+      if (err) {
+	      tvhlog(LOG_ALERT, "settings", "Unable to create dir \"%s\": %s",
+	             path, strerror(errno));
+	      return -1;
+      }
+      path[x] = '/';
+    }
+    x++;
+  }
+  return 0;
+}
+
+int
+rmtree ( const char *path )
+{
+  int err = 0;
+  struct dirent de, *der;
+  struct stat st;
+  char buf[512];
+  DIR *dir = opendir(path);
+  if (!dir) return -1;
+  while (!readdir_r(dir, &de, &der) && der) {
+    if (!strcmp("..", de.d_name) || !strcmp(".", de.d_name))
+      continue;
+    snprintf(buf, sizeof(buf), "%s/%s", path, de.d_name);
+    err = stat(buf, &st);
+    if (err) break;
+    if (S_ISDIR(st.st_mode))
+      err = rmtree(buf);
+    else
+      err = unlink(buf);
+    if (err) break;
+  }
+  closedir(dir);
+  if (!err)
+    err = rmdir(path);
+  return err;
+}
+
+char *
+regexp_escape(const char* str)
+{
+  const char *a;
+  char *tmp, *b;
+  if (!str)
+    return NULL;
+  a = str;
+  b = tmp = malloc(strlen(str) * 2);
+  while (*a) {
+    switch (*a) {
+      case '?':
+      case '+':
+      case '.':
+      case '(':
+      case ')':
+      case '[':
+      case ']':
+      case '*':
+        *b = '\\';
+        b++;
+        /* -fallthrough */
+      default:
+        break;
+    }
+    *b = *a;
+    b++;
+    a++;
+  }
+  *b = 0;
+  return tmp;
 }

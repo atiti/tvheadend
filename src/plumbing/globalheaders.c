@@ -205,6 +205,12 @@ gh_hold(globalheaders_t *gh, streaming_message_t *sm)
 						  pkt->pkt_componentindex);
     assert(ssc != NULL);
 
+    if(ssc->ssc_type == SCT_TELETEXT) {
+      free(sm);
+      ssc->ssc_disabled = 1;
+      break;
+    }
+
     pkt = convertpkt(ssc, pkt);
 
     apply_header(ssc, pkt);
@@ -246,8 +252,12 @@ gh_hold(globalheaders_t *gh, streaming_message_t *sm)
 
   case SMT_EXIT:
   case SMT_SERVICE_STATUS:
+  case SMT_SIGNAL_STATUS:
   case SMT_NOSTART:
   case SMT_MPEGTS:
+  case SMT_SPEED:
+  case SMT_SKIP:
+  case SMT_TIMESHIFT_STATUS:
     streaming_target_deliver2(gh->gh_output, sm);
     break;
   }
@@ -273,8 +283,12 @@ gh_pass(globalheaders_t *gh, streaming_message_t *sm)
     // FALLTHRU
   case SMT_EXIT:
   case SMT_SERVICE_STATUS:
+  case SMT_SIGNAL_STATUS:
   case SMT_NOSTART:
   case SMT_MPEGTS:
+  case SMT_SKIP:
+  case SMT_SPEED:
+  case SMT_TIMESHIFT_STATUS:
     streaming_target_deliver2(gh->gh_output, sm);
     break;
 

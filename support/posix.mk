@@ -1,22 +1,21 @@
+MAN = $(ROOTDIR)/man/tvheadend.1
+ICON = $(ROOTDIR)/support/gnome/tvheadend.svg
 
-INSTBIN=  ${DESTDIR}${INSTALLPREFIX}/bin
-INSTMAN=  ${DESTDIR}${INSTALLPREFIX}/share/man/man1
-INSTDBG=  ${DESTDIR}${INSTALLPREFIX}/lib/debug/bin
-MAN=man/tvheadend.1
+INSTICON= ${DESTDIR}$(prefix)/share/icons/hicolor/scalable/apps
+
 
 install: ${PROG} ${MAN}
-	mkdir -p ${INSTBIN}
-	install -T ${PROG} ${INSTBIN}/tvheadend
-	mkdir -p ${INSTMAN}
-	install ${MAN} ${INSTMAN}
+	install -D ${PROG} ${DESTDIR}${bindir}/tvheadend
+	install -D ${MAN} ${DESTDIR}${mandir}/tvheadend.1
 
-install-debug: ${PROG}
-	mkdir -p ${INSTDBG}
-	objcopy --only-keep-debug ${INSTBIN}/tvheadend ${INSTDBG}/tvheadend.debug
-	strip -g ${INSTBIN}/tvheadend
-	objcopy --add-gnu-debuglink=${INSTDBG}/tvheadend.debug ${INSTBIN}/tvheadend
+	for bundle in ${BUNDLES}; do \
+		mkdir -p ${DESTDIR}${datadir}/tvheadend/$$bundle ;\
+		cp -r $(ROOTDIR)/$$bundle/*  ${DESTDIR}${datadir}/tvheadend/$$bundle ;\
+	done
+
+	find ${DESTDIR}${datadir}/tvheadend -name .git -exec rm -rf {} \; &>/dev/null || /bin/true
 
 uninstall:
-	rm -f ${INSTBIN}/tvheadend
-	rm -f ${INSTDBG}/tvheadend.debug
-	rm -f ${INSTMAN}/tvheadend.1
+	rm -f ${DESTDIR}${bindir}/tvheadend
+	rm -f ${DESTDIR}${mandir}/tvheadend.1
+	rm -rf ${DESTDIR}${datadir}/tvheadend

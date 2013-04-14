@@ -397,7 +397,7 @@ v4l_service_start(service_t *t, unsigned int weight, int force_start)
   }
   if(pipe(va->va_pipe)) {
     tvhlog(LOG_ERR, "v4l",
-	   "%s: Unable to create control pipe", va->va_path, strerror(errno));
+	   "%s: Unable to create control pipe [%s]", va->va_path, strerror(errno));
     close(fd);
     return -1;
   }
@@ -599,7 +599,7 @@ v4l_service_stop(service_t *t)
 	tvhlog(LOG_DEBUG, "v4l", "INPUT_MMAP stopped");
   }
 
-  if(write(va->va_pipe[1], &c, 1) != 1)
+  if(tvh_write(va->va_pipe[1], &c, 1))
     tvhlog(LOG_ERR, "v4l", "Unable to close video thread -- %s",
 	   strerror(errno));
   
@@ -650,6 +650,15 @@ v4l_service_quality(service_t *t)
   return 100;
 }
 
+/**
+ *
+ */
+static int
+v4l_service_is_enabled(service_t *t)
+{
+  return t->s_enabled;
+}
+
 
 /**
  *
@@ -670,6 +679,7 @@ v4l_service_setsourceinfo(service_t *t, struct source_info *si)
   char buf[64];
   memset(si, 0, sizeof(struct source_info));
 
+  si->si_type = S_MPEG_PS;
   si->si_adapter = strdup(t->s_v4l_adapter->va_displayname);
 
   snprintf(buf, sizeof(buf), "%d Hz", t->s_v4l_frequency);
@@ -717,6 +727,7 @@ v4l_service_find(v4l_adapter_t *va, const char *id, int create)
   t->s_config_save   = v4l_service_save;
   t->s_setsourceinfo = v4l_service_setsourceinfo;
   t->s_quality_index = v4l_service_quality;
+  t->s_is_enabled    = v4l_service_is_enabled;
   t->s_grace_period  = v4l_grace_period;
   t->s_iptv_fd = -1;
   t->s_v4l_adapter = va;
@@ -876,7 +887,7 @@ v4l_adapter_check(const char *path, int fd)
 	   path,
 	   fmtdesc.index,
 	   fmtdesc.description,
-	   &fmtdesc.pixelformat,
+	   (char*)&fmtdesc.pixelformat,
 	   fmtdesc.flags & V4L2_FMT_FLAG_COMPRESSED ? "(compressed)" : "");
 
     if(fmtdesc.pixelformat == V4L2_PIX_FMT_MPEG)

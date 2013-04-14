@@ -40,6 +40,8 @@
 #include "parsers.h"
 #include "streaming.h"
 
+#define TS_REMUX_BUFSIZE (188 * 100)
+
 static void ts_remux(service_t *t, const uint8_t *tsb);
 
 /**
@@ -101,7 +103,6 @@ ts_recv_packet0(service_t *t, elementary_stream_t *st, const uint8_t *tsb)
   switch(st->es_type) {
 
   case SCT_CA:
-  case SCT_PAT:
   case SCT_PMT:
     if(st->es_section == NULL)
       st->es_section = calloc(1, sizeof(struct psi_section));
@@ -110,11 +111,13 @@ ts_recv_packet0(service_t *t, elementary_stream_t *st, const uint8_t *tsb)
 			   got_section, st);
     break;
 
-  case SCT_TELETEXT:
-    teletext_input(t, st, tsb);
-    break;
-
   default:
+    if(!streaming_pad_probe_type(&t->s_streaming_pad, SMT_PACKET))
+      break;
+
+    if(st->es_type == SCT_TELETEXT)
+      teletext_input(t, st, tsb);
+
     if(off > 188)
       break;
 
@@ -142,8 +145,6 @@ ts_extract_pcr(service_t *t, elementary_stream_t *st, const uint8_t *tsb,
   pcr |= (uint64_t)tsb[9] << 1;
   pcr |= ((uint64_t)tsb[10] >> 7) & 0x01;
   
-  pcr = pcr;
-
   if(pcrp != NULL)
     *pcrp = pcr;
 
@@ -222,7 +223,7 @@ ts_recv_packet1(service_t *t, const uint8_t *tsb, int64_t *pcrp)
 
   if((tsb[3] & 0xc0) ||
       (t->s_scrambled_seen && st->es_type != SCT_CA &&
-       st->es_type != SCT_PAT && st->es_type != SCT_PMT)) {
+       st->es_type != SCT_PMT)) {
 
     /**
      * Lock for descrambling, but only if packet was not in error
@@ -246,7 +247,7 @@ ts_recv_packet1(service_t *t, const uint8_t *tsb, int64_t *pcrp)
 	m++;
     }
 
-    if(!error) {
+    if(!error && t->s_scrambled != 0) {
       if(n == 0) {
 	service_set_streaming_status_flags(t, TSS_NO_DESCRAMBLER);
       } else if(m == n) {
@@ -281,11 +282,39 @@ ts_recv_packet2(service_t *t, const uint8_t *tsb)
 static void
 ts_remux(service_t *t, const uint8_t *src)
 {
-  uint8_t tsb[188];
-  memcpy(tsb, src, 188);
-
   streaming_message_t sm;
+  pktbuf_t *pb;
+  sbuf_t *sb = &t->s_tsbuf;
+
+  sbuf_append(sb, src, 188);
+
+  if(sb->sb_ptr < TS_REMUX_BUFSIZE) 
+    return;
+
+  pb = pktbuf_alloc(sb->sb_data, sb->sb_ptr);
+
   sm.sm_type = SMT_MPEGTS;
-  sm.sm_data = tsb;
+  sm.sm_data = pb;
   streaming_pad_deliver(&t->s_streaming_pad, &sm);
+
+  pktbuf_ref_dec(pb);
+
+  service_set_streaming_status_flags(t, TSS_PACKETS);
+
+  sbuf_reset(sb);
+}
+
+/*
+ * Attempt to re-sync a ts stream (3 valid sync's in a row)
+ */
+int
+ts_resync ( const uint8_t *tsb, int *len, int *idx )
+{
+  int err = 1;
+  while (err && (*len > 376)) {
+    (*idx)++; (*len)--;
+    err = (tsb[*idx] != 0x47) || (tsb[*idx+188] != 0x47) || 
+          (tsb[*idx+376] != 0x47);
+  }
+  return err;
 }

@@ -1,6 +1,6 @@
 /*
  *  Services
- *  Copyright (C) 2010 Andreas Öman
+ *  Copyright (C) 2010 Andreas Ã–man
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -46,7 +46,8 @@
 #include "serviceprobe.h"
 #include "atomic.h"
 #include "dvb/dvb.h"
-#include "htsp.h"
+#include "htsp_server.h"
+#include "lang_codes.h"
 
 #define SERVICE_HASH_WIDTH 101
 
@@ -109,18 +110,21 @@ stream_clean(elementary_stream_t *st)
   st->es_global_data_len = 0;
 }
 
-
 /**
  *
  */
 void
-service_stream_destroy(service_t *t, elementary_stream_t *st)
+service_stream_destroy(service_t *t, elementary_stream_t *es)
 {
   if(t->s_status == SERVICE_RUNNING)
-    stream_clean(st);
-  TAILQ_REMOVE(&t->s_components, st, es_link);
-  free(st->es_nicename);
-  free(st);
+    stream_clean(es);
+
+  avgstat_flush(&es->es_rate);
+  avgstat_flush(&es->es_cc_errors);
+
+  TAILQ_REMOVE(&t->s_components, es, es_link);
+  free(es->es_nicename);
+  free(es);
 }
 
 /**
@@ -151,6 +155,8 @@ service_stop(service_t *t)
    */
   TAILQ_FOREACH(st, &t->s_components, es_link)
     stream_clean(st);
+
+  sbuf_free(&t->s_tsbuf);
 
   t->s_status = SERVICE_IDLE;
 
@@ -202,8 +208,10 @@ service_start(service_t *t, unsigned int weight, int force_start)
   if((r = t->s_start_feed(t, weight, force_start)))
     return r;
 
+#if ENABLE_CWC
   cwc_service_start(t);
   capmt_service_start(t);
+#endif
 
   pthread_mutex_lock(&t->s_stream_mutex);
 
@@ -231,7 +239,7 @@ service_start(service_t *t, unsigned int weight, int force_start)
 static int
 dvb_extra_prio(th_dvb_adapter_t *tda)
 {
-  return tda->tda_hostconnection * 10;
+  return tda->tda_extrapriority + tda->tda_hostconnection * 10;
 }
 
 /**
@@ -285,12 +293,23 @@ servicecmp(const void *A, const void *B)
   service_t *a = *(service_t **)A;
   service_t *b = *(service_t **)B;
 
-  int q = service_get_quality(a) - service_get_quality(b);
+  /* only check quality if both adapters have the same prio
+   *
+   * there needs to be a much more sophisticated algorithm to take priority and quality into account
+   * additional, it may be problematic, since a higher priority value lowers the ranking
+   *
+   */
+  int prio_a = service_get_prio(a);
+  int prio_b = service_get_prio(b);
+  if (prio_a == prio_b) {
 
-  if(q != 0)
-    return q; /* Quality precedes priority */
+    int q = service_get_quality(a) - service_get_quality(b);
 
-  return service_get_prio(a) - service_get_prio(b);
+    if(q != 0)
+      return q; /* Quality precedes priority */
+  }
+
+  return prio_a - prio_b;
 }
 
 
@@ -316,7 +335,7 @@ service_find(channel_t *ch, unsigned int weight, const char *loginfo,
   cnt = 0;
   LIST_FOREACH(t, &ch->ch_services, s_ch_link) {
 
-    if(!t->s_enabled) {
+    if(!t->s_is_enabled(t)) {
       if(loginfo != NULL) {
 	tvhlog(LOG_NOTICE, "Service", "%s: Skipping \"%s\" -- not enabled",
 	       loginfo, service_nicename(t));
@@ -325,16 +344,10 @@ service_find(channel_t *ch, unsigned int weight, const char *loginfo,
       continue;
     }
 
-    if(t->s_quality_index(t) < 10) {
-      if(loginfo != NULL) {
-	tvhlog(LOG_NOTICE, "Service", 
-	       "%s: Skipping \"%s\" -- Quality below 10%",
-	       loginfo, service_nicename(t));
-	err = SM_CODE_BAD_SIGNAL;
-      }
-      continue;
-    }
     vec[cnt++] = t;
+    tvhlog(LOG_DEBUG, "Service",
+    		"%s: Adding adapter \"%s\" for service \"%s\"",
+    		 loginfo, service_adapter_nicename(t), service_nicename(t));
   }
 
   /* Sort services, lower priority should come come earlier in the vector
@@ -360,6 +373,17 @@ service_find(channel_t *ch, unsigned int weight, const char *loginfo,
     t = vec[i];
     if(t->s_status == SERVICE_RUNNING) 
       return t;
+    if(t->s_quality_index(t) < 10) {
+      if(loginfo != NULL) {
+         tvhlog(LOG_NOTICE, "Service",
+	       "%s: Skipping \"%s\" -- Quality below 10%%",
+	       loginfo, service_nicename(t));
+         err = SM_CODE_BAD_SIGNAL;
+      }
+      continue;
+    }
+    tvhlog(LOG_DEBUG, "Service", "%s: Probing adapter \"%s\" without stealing for service \"%s\"",
+	     loginfo, service_adapter_nicename(t), service_nicename(t));
     if((r = service_start(t, 0, 0)) == 0)
       return t;
     if(loginfo != NULL)
@@ -372,6 +396,9 @@ service_find(channel_t *ch, unsigned int weight, const char *loginfo,
 
   for(i = off; i < cnt; i++) {
     t = vec[i];
+    tvhlog(LOG_DEBUG, "Service", "%s: Probing adapter \"%s\" with weight %d for service \"%s\"",
+	     loginfo, service_adapter_nicename(t), weight, service_nicename(t));
+
     if((r = service_start(t, weight, 0)) == 0)
       return t;
     *errorp = r;
@@ -436,7 +463,6 @@ service_destroy(service_t *t)
 {
   elementary_stream_t *st;
   th_subscription_t *s;
-  channel_t *ch = t->s_ch;
 
   if(t->s_dtor != NULL)
     t->s_dtor(t);
@@ -465,23 +491,20 @@ service_destroy(service_t *t)
   free(t->s_identifier);
   free(t->s_svcname);
   free(t->s_provider);
-  free(t->s_dvb_default_charset);
+  free(t->s_dvb_charset);
 
-  while((st = TAILQ_FIRST(&t->s_components)) != NULL) {
-    TAILQ_REMOVE(&t->s_components, st, es_link);
-    free(st->es_nicename);
-    free(st);
-  }
+  while((st = TAILQ_FIRST(&t->s_components)) != NULL)
+    service_stream_destroy(t, st);
 
   free(t->s_pat_section);
   free(t->s_pmt_section);
 
-  service_unref(t);
+  sbuf_free(&t->s_tsbuf);
 
-  if(ch != NULL) {
-    if(LIST_FIRST(&ch->ch_services) == NULL) 
-      channel_delete(ch);
-  }
+  avgstat_flush(&t->s_cc_errors);
+  avgstat_flush(&t->s_rate);
+
+  service_unref(t);
 }
 
 
@@ -504,9 +527,11 @@ service_create(const char *identifier, int type, int source_type)
   t->s_refcount = 1;
   t->s_enabled = 1;
   t->s_pcr_last = PTS_UNSET;
-  t->s_dvb_default_charset = NULL;
+  t->s_dvb_charset = NULL;
   t->s_dvb_eit_enable = 1;
   TAILQ_INIT(&t->s_components);
+
+  sbuf_init(&t->s_tsbuf);
 
   streaming_pad_init(&t->s_streaming_pad);
 
@@ -682,15 +707,15 @@ service_map_channel(service_t *t, channel_t *ch, int save)
  *
  */
 void
-service_set_dvb_default_charset(service_t *t, const char *dvb_default_charset)
+service_set_dvb_charset(service_t *t, const char *dvb_charset)
 {
   lock_assert(&global_lock);
 
-  if(t->s_dvb_default_charset != NULL && !strcmp(t->s_dvb_default_charset, dvb_default_charset))
+  if(t->s_dvb_charset != NULL && !strcmp(t->s_dvb_charset, dvb_charset))
     return;
 
-  free(t->s_dvb_default_charset);
-  t->s_dvb_default_charset = strdup(dvb_default_charset);
+  free(t->s_dvb_charset);
+  t->s_dvb_charset = strdup(dvb_charset);
   t->s_config_save(t);
 }
 
@@ -730,6 +755,14 @@ static struct strtab stypetab[] = {
   { "SDTV",         ST_SDTV },
   { "Radio",        ST_RADIO },
   { "HDTV",         ST_HDTV },
+  { "HDTV",         ST_EX_HDTV },
+  { "SDTV",         ST_EX_SDTV },
+  { "HDTV",         ST_EP_HDTV },
+  { "HDTV",         ST_ET_HDTV },
+  { "SDTV",         ST_DN_SDTV },
+  { "HDTV",         ST_DN_HDTV },
+  { "SDTV",         ST_SK_SDTV },
+  { "SDTV",         ST_NE_SDTV },
   { "SDTV-AC",      ST_AC_SDTV },
   { "HDTV-AC",      ST_AC_HDTV },
 };
@@ -744,22 +777,40 @@ service_servicetype_txt(service_t *t)
  *
  */
 int
-service_is_tv(service_t *t)
+servicetype_is_tv(int servicetype)
 {
   return 
-    t->s_servicetype == ST_SDTV    ||
-    t->s_servicetype == ST_HDTV    ||
-    t->s_servicetype == ST_AC_SDTV ||
-    t->s_servicetype == ST_AC_HDTV;
+    servicetype == ST_SDTV    ||
+    servicetype == ST_HDTV    ||
+    servicetype == ST_EX_HDTV ||
+    servicetype == ST_EX_SDTV ||
+    servicetype == ST_EP_HDTV ||
+    servicetype == ST_ET_HDTV ||
+    servicetype == ST_DN_SDTV ||
+    servicetype == ST_DN_HDTV ||
+    servicetype == ST_SK_SDTV ||
+    servicetype == ST_NE_SDTV ||
+    servicetype == ST_AC_SDTV ||
+    servicetype == ST_AC_HDTV;
+}
+int
+service_is_tv(service_t *t)
+{
+  return servicetype_is_tv(t->s_servicetype);
 }
 
 /**
  *
  */
 int
+servicetype_is_radio(int servicetype)
+{
+  return servicetype == ST_RADIO;
+}
+int
 service_is_radio(service_t *t)
 {
-  return t->s_servicetype == ST_RADIO;
+  return servicetype_is_radio(t->s_servicetype);
 }
 
 /**
@@ -862,12 +913,14 @@ service_build_stream_start(service_t *t)
     ssc->ssc_pid = st->es_pid;
     ssc->ssc_width = st->es_width;
     ssc->ssc_height = st->es_height;
+    ssc->ssc_frameduration = st->es_frame_duration;
   }
 
   t->s_setsourceinfo(t, &ss->ss_si);
 
   ss->ss_refcount = 1;
   ss->ss_pcr_pid = t->s_pcr_pid;
+  ss->ss_pmt_pid = t->s_pmt_pid;
   return ss;
 }
 
@@ -886,6 +939,15 @@ service_set_enable(service_t *t, int enabled)
   subscription_reschedule();
 }
 
+void
+service_set_prefcapid(service_t *t, uint32_t prefcapid)
+{
+  if(t->s_prefcapid == prefcapid)
+    return;
+
+  t->s_prefcapid = prefcapid;
+  t->s_config_save(t);
+}
 
 static pthread_mutex_t pending_save_mutex;
 static pthread_cond_t pending_save_cond;
@@ -1012,6 +1074,30 @@ service_component_nicename(elementary_stream_t *st)
 }
 
 const char *
+service_adapter_nicename(service_t *t)
+{
+  switch(t->s_type) {
+  case SERVICE_TYPE_DVB:
+    if(t->s_dvb_mux_instance)
+      return t->s_dvb_mux_instance->tdmi_identifier;
+    else
+      return "Unknown adapter";
+
+  case SERVICE_TYPE_IPTV:
+    return t->s_iptv_iface;
+
+  case SERVICE_TYPE_V4L:
+    if(t->s_v4l_adapter)
+      return t->s_v4l_adapter->va_displayname;
+    else
+      return "Unknown adapter";
+
+  default:
+    return "Unknown adapter";
+  }
+}
+
+const char *
 service_tss2text(int flags)
 {
   if(flags & TSS_NO_ACCESS)
@@ -1093,21 +1179,36 @@ service_get_encryption(service_t *t)
   return 0;
 }
 
-
-/**
- * Get the signal status from a service
+/*
+ * Find the primary EPG service (to stop EPG trying to update
+ * from multiple OTA sources)
  */
 int
-service_get_signal_status(service_t *t, signal_status_t *status)
+service_is_primary_epg(service_t *svc)
 {
-  // get signal status from the service
-  switch(t->s_type) {
-#if ENABLE_LINUXDVB
-  case SERVICE_TYPE_DVB:
-    return dvb_transport_get_signal_status(t, status);
-#endif
-  default:
-    return -1;
+  service_t *ret = NULL, *t;
+  if (!svc || !svc->s_ch) return 0;
+  LIST_FOREACH(t, &svc->s_ch->ch_services, s_ch_link) {
+    if (!t->s_is_enabled(t) || !t->s_dvb_eit_enable) continue;
+    if (!ret || service_get_prio(t) < service_get_prio(ret))
+      ret = t;
   }
+  return !ret ? 0 : (ret->s_dvb_service_id == svc->s_dvb_service_id);
 }
 
+/*
+ * list of known service types
+ */
+htsmsg_t *servicetype_list ( void )
+{
+  htsmsg_t *ret, *e;
+  int i;
+  ret = htsmsg_create_list();
+  for (i = 0; i < sizeof(stypetab) / sizeof(stypetab[0]); i++ ) {
+    e = htsmsg_create_map();
+    htsmsg_add_u32(e, "val", stypetab[i].val);
+    htsmsg_add_str(e, "str", stypetab[i].str);
+    htsmsg_add_msg(ret, NULL, e);
+  }
+  return ret;
+}

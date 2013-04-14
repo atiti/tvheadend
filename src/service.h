@@ -81,7 +81,7 @@ typedef struct elementary_stream {
   uint16_t es_aspect_num;
   uint16_t es_aspect_den;
 
-  char es_lang[4];           /* ISO 639 3-letter language code */
+  char es_lang[4];           /* ISO 639 2B 3-letter language code */
   uint16_t es_composition_id;
   uint16_t es_ancillary_id;
 
@@ -226,6 +226,7 @@ typedef struct service {
    */ 
   enum {
     S_MPEG_TS,
+    S_MPEG_PS,
     S_OTHER,
   } s_source_type;
 
@@ -248,6 +249,7 @@ typedef struct service {
    * subscription scheduling.
    */
   int s_enabled;
+  int (*s_is_enabled)(struct service *t);
 
   /**
    * Last PCR seen, we use it for a simple clock for rawtsinput.c
@@ -310,6 +312,11 @@ typedef struct service {
    */
   char *s_provider;
 
+  /**
+   * Default authority
+   */
+  char *s_default_authority;
+
   enum {
     /* Service types defined in EN 300 468 */
 
@@ -318,6 +325,14 @@ typedef struct service {
     ST_HDTV       = 0x11,   /* HDTV (MPEG2) */
     ST_AC_SDTV    = 0x16,   /* Advanced codec SDTV */
     ST_AC_HDTV    = 0x19,   /* Advanced codec HDTV */
+    ST_NE_SDTV    = 0x80,   /* NET POA - Cabo SDTV */
+    ST_EX_HDTV    = 0x91,   /* Bell TV HDTV */
+    ST_EX_SDTV    = 0x96,   /* Bell TV SDTV */
+    ST_EP_HDTV    = 0xA0,   /* Bell TV tiered HDTV */
+    ST_ET_HDTV    = 0xA6,   /* Bell TV tiered HDTV */
+    ST_DN_SDTV    = 0xA8,   /* DN advanced SDTV */
+    ST_DN_HDTV    = 0xA4,   /* DN HDTV */
+    ST_SK_SDTV    = 0xd3    /* SKY TV SDTV */
   } s_servicetype;
 
 
@@ -325,7 +340,6 @@ typedef struct service {
    * Teletext...
    */
   th_commercial_advice_t s_tt_commercial_advice;
-  int s_tt_rundown_content_length;
   time_t s_tt_clock;   /* Network clock as determined by teletext decoder */
  
   /**
@@ -435,6 +449,13 @@ typedef struct service {
   elementary_stream_t *s_video;
   elementary_stream_t *s_audio;
  
+
+  /**
+   * When a subscription request SMT_MPEGTS, chunk them togeather 
+   * in order to recude load.
+   */
+  sbuf_t s_tsbuf;
+
   /**
    * Average continuity errors
    */
@@ -453,6 +474,7 @@ typedef struct service {
   int s_scrambled;
   int s_scrambled_seen;
   int s_caid;
+  uint16_t s_prefcapid;
 
   /**
    * PCR drift compensation. This should really be per-packet.
@@ -480,7 +502,7 @@ typedef struct service {
    * DVB default charset
    * 	used to overide the default ISO6937 per service
    */
-  char *s_dvb_default_charset;
+  char *s_dvb_charset;
 
   /**
    * Set if EIT grab is enabled for DVB service (the default).
@@ -529,6 +551,10 @@ int service_is_tv(service_t *t);
 
 int service_is_radio(service_t *t);
 
+int servicetype_is_tv(int st);
+
+int servicetype_is_radio(int st);
+
 void service_destroy(service_t *t);
 
 void service_remove_subscriber(service_t *t, struct th_subscription *s,
@@ -557,6 +583,8 @@ const char *service_nicename(service_t *t);
 
 const char *service_component_nicename(elementary_stream_t *st);
 
+const char *service_adapter_nicename(service_t *t);
+
 const char *service_tss2text(int flags);
 
 static inline int service_tss_is_error(int flags)
@@ -570,10 +598,14 @@ int tss2errcode(int tss);
 
 uint16_t service_get_encryption(service_t *t);
 
-int service_get_signal_status(service_t *t, signal_status_t *status);
-
-void service_set_dvb_default_charset(service_t *t, const char *dvb_default_charset);
+void service_set_dvb_charset(service_t *t, const char *dvb_charset);
 
 void service_set_dvb_eit_enable(service_t *t, int dvb_eit_enable);
+
+void service_set_prefcapid(service_t *t, uint32_t prefcapid);
+
+int service_is_primary_epg (service_t *t);
+
+htsmsg_t *servicetype_list (void);
 
 #endif // SERVICE_H__

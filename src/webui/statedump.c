@@ -28,8 +28,8 @@
 #include "webui.h"
 #include "access.h"
 #include "epg.h"
-#include "xmltv.h"
 #include "psi.h"
+#include "channels.h"
 #if ENABLE_LINUXDVB
 #include "dvr/dvr.h"
 #include "dvb/dvb.h"
@@ -37,7 +37,6 @@
 #endif
 
 extern char tvh_binshasum[20];
-extern char *htsversion_full;
 
 int page_statedump(http_connection_t *hc, const char *remain, void *opaque);
 
@@ -69,12 +68,10 @@ dumpchannels(htsbuf_queue_t *hq)
 		   "  refcount = %d\n"
 		   "  zombie = %d\n"
 		   "  number = %d\n"
-		   "  xmltv source = %s\n"
 		   "  icon = %s\n\n",
 		   ch->ch_refcount,
 		   ch->ch_zombie,
 		   ch->ch_number,
-		   ch->ch_xc ? ch->ch_xc->xc_displayname : "<none set>",
 		   ch->ch_icon ?: "<none set>");
   }
 }
@@ -162,7 +159,7 @@ page_statedump(http_connection_t *hc, const char *remain, void *opaque)
   htsbuf_qprintf(hq, "Tvheadend %s  Binary SHA1: "
 		 "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x"
 		 "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
-		 htsversion_full,
+		 tvheadend_version,
 		 tvh_binshasum[0],
 		 tvh_binshasum[1],
 		 tvh_binshasum[2],

@@ -1,29 +1,33 @@
-
-		    Tvheadend TV streaming server
-		    =============================
-
-		 (c) 2006 - 2010 Andreas Öman, et al.
-
-
+Tvheadend (TV streaming server) v3.5
+====================================
+(c) 2006 - 2013 Andreas Öman, et al.
 
 How to build for Linux
-======================
+----------------------
 
 First you need to configure:
 
-$ ./configure
+	$ ./configure
 
-If any dependencies are missing the configure script will complain.
-You then have the option to disable that particular module/subsystem.
+If any dependencies are missing the configure script will complain or attempt
+to disable optional features.
 
-$ make
+Build the binary:
 
-Build the binary, after build the binary resides in 'build.Linux/'.
+	$ make
+
+After build, the binary resides in `build.linux/`.
+
 Thus, to start it, just type:
 
-$ build.Linux/tvheadend
+	$ ./build.linux/tvheadend
 
-Settings are stored in $HOME/.hts/tvheadend
+Settings are stored in `$HOME/.hts/tvheadend`.
 
-For more information and latest versions, please visit:
-http://www.lonelycoder.com/hts/
+Further information
+-------------------
+
+For more information about building, including generating packages please visit:
+> https://www.lonelycoder.com/redmine/projects/tvheadend/wiki/Building
+> https://www.lonelycoder.com/redmine/projects/tvheadend/wiki/Packaging
+> https://www.lonelycoder.com/redmine/projects/tvheadend/wiki/Git

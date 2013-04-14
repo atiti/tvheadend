@@ -145,17 +145,29 @@ extjs_dvbadapter(http_connection_t *hc, const char *remain, void *opaque)
   if(!strcmp(op, "load")) {
     r = htsmsg_create_map();
     htsmsg_add_str(r, "id", tda->tda_identifier);
+    htsmsg_add_u32(r, "enabled", tda->tda_enabled);
     htsmsg_add_str(r, "device", tda->tda_rootpath ?: "No hardware attached");
     htsmsg_add_str(r, "name", tda->tda_displayname);
     htsmsg_add_u32(r, "automux", tda->tda_autodiscovery);
+    htsmsg_add_u32(r, "skip_initialscan", tda->tda_skip_initialscan);
     htsmsg_add_u32(r, "idlescan", tda->tda_idlescan);
+    htsmsg_add_u32(r, "idleclose", tda->tda_idleclose);
+    htsmsg_add_u32(r, "skip_checksubscr", tda->tda_skip_checksubscr);
     htsmsg_add_u32(r, "qmon", tda->tda_qmon);
-    htsmsg_add_u32(r, "dumpmux", tda->tda_dump_muxes);
+    htsmsg_add_u32(r, "poweroff", tda->tda_poweroff);
+    htsmsg_add_u32(r, "sidtochan", tda->tda_sidtochan);
     htsmsg_add_u32(r, "nitoid", tda->tda_nitoid);
+    htsmsg_add_u32(r, "disable_pmt_monitor", tda->tda_disable_pmt_monitor);
+    htsmsg_add_u32(r, "full_mux_rx", tda->tda_full_mux_rx+1);
+    htsmsg_add_u32(r, "grace_period", tda->tda_grace_period);
     htsmsg_add_str(r, "diseqcversion", 
 		   ((const char *[]){"DiSEqC 1.0 / 2.0",
 				       "DiSEqC 1.1 / 2.1"})
 		   [tda->tda_diseqc_version % 2]);
+    htsmsg_add_str(r, "diseqcrepeats",
+		   ((const char *[]){"0", "1", "3"})
+		   [tda->tda_diseqc_repeats % 3]);
+    htsmsg_add_u32(r, "extrapriority", tda->tda_extrapriority);
  
     out = json_single_record(r, "dvbadapters");
   } else if(!strcmp(op, "save")) {
@@ -163,17 +175,41 @@ extjs_dvbadapter(http_connection_t *hc, const char *remain, void *opaque)
     if((s = http_arg_get(&hc->hc_req_args, "name")) != NULL)
       dvb_adapter_set_displayname(tda, s);
 
+    s = http_arg_get(&hc->hc_req_args, "enabled");
+    dvb_adapter_set_enabled(tda, !!s);
+
     s = http_arg_get(&hc->hc_req_args, "automux");
     dvb_adapter_set_auto_discovery(tda, !!s);
+
+    s = http_arg_get(&hc->hc_req_args, "skip_initialscan");
+    dvb_adapter_set_skip_initialscan(tda, !!s);
 
     s = http_arg_get(&hc->hc_req_args, "idlescan");
     dvb_adapter_set_idlescan(tda, !!s);
 
+    s = http_arg_get(&hc->hc_req_args, "idleclose");
+    dvb_adapter_set_idleclose(tda, !!s);
+
+    s = http_arg_get(&hc->hc_req_args, "skip_checksubscr");
+    dvb_adapter_set_skip_checksubscr(tda, !!s);
+
     s = http_arg_get(&hc->hc_req_args, "qmon");
     dvb_adapter_set_qmon(tda, !!s);
 
-    s = http_arg_get(&hc->hc_req_args, "dumpmux");
-    dvb_adapter_set_dump_muxes(tda, !!s);
+    s = http_arg_get(&hc->hc_req_args, "poweroff");
+    dvb_adapter_set_poweroff(tda, !!s);
+
+    s = http_arg_get(&hc->hc_req_args, "sidtochan");
+    dvb_adapter_set_sidtochan(tda, !!s);
+
+    s = http_arg_get(&hc->hc_req_args, "disable_pmt_monitor");
+    dvb_adapter_set_disable_pmt_monitor(tda, !!s);
+
+    s = http_arg_get(&hc->hc_req_args, "full_mux_rx");
+    dvb_adapter_set_full_mux_rx(tda, atoi(s)-1);
+
+    s = http_arg_get(&hc->hc_req_args, "grace_period");
+    dvb_adapter_set_grace_period(tda, atoi(s));
 
     if((s = http_arg_get(&hc->hc_req_args, "nitoid")) != NULL)
       dvb_adapter_set_nitoid(tda, atoi(s));
@@ -184,6 +220,17 @@ extjs_dvbadapter(http_connection_t *hc, const char *remain, void *opaque)
       else if(!strcmp(s, "DiSEqC 1.1 / 2.1"))
 	dvb_adapter_set_diseqc_version(tda, 1);
     }
+
+    if((s = http_arg_get(&hc->hc_req_args, "diseqcrepeats")) != NULL) {
+      if(!strcmp(s, "0"))
+        dvb_adapter_set_diseqc_repeats(tda, 0);
+      else if(!strcmp(s, "1"))
+        dvb_adapter_set_diseqc_repeats(tda, 1);
+      else if(!strcmp(s, "2"))
+        dvb_adapter_set_diseqc_repeats(tda, 2);
+    }
+    if((s = http_arg_get(&hc->hc_req_args, "extrapriority")) != NULL)
+      dvb_adapter_set_extrapriority(tda, atoi(s));
 
     out = htsmsg_create_map();
     htsmsg_add_u32(out, "success", 1);
@@ -397,7 +444,7 @@ extjs_dvbservices(http_connection_t *hc, const char *remain, void *opaque)
     qsort(tvec, count, sizeof(service_t *), transportcmp);
 
     for(i = 0; i < count; i++)
-      htsmsg_add_msg(array, NULL, dvb_transport_build_msg(tvec[i]));
+      htsmsg_add_msg(array, NULL, dvb_service_build_msg(tvec[i]));
 
     htsmsg_add_msg(out, "entries", array);
 
@@ -454,11 +501,14 @@ extjs_dvbsatconf(http_connection_t *hc, const char *remain, void *opaque)
   htsbuf_queue_t *hq = &hc->hc_reply;
   th_dvb_adapter_t *tda;
   htsmsg_t *out;
+  const char *adapter = http_arg_get(&hc->hc_req_args, "adapter");
 
   pthread_mutex_lock(&global_lock);
 
-  if(remain == NULL ||
-     (tda = dvb_adapter_find_by_identifier(remain)) == NULL) {
+  if((remain == NULL ||
+      (tda = dvb_adapter_find_by_identifier(remain)) == NULL) &&
+     (adapter == NULL ||
+      (tda = dvb_adapter_find_by_identifier(adapter)) == NULL)) {
     pthread_mutex_unlock(&global_lock);
     return 404;
   }
@@ -582,9 +632,11 @@ extjs_dvb_copymux(http_connection_t *hc, const char *remain, void *opaque)
   th_dvb_adapter_t *tda;
   htsmsg_t *in;
   const char *entries   = http_arg_get(&hc->hc_req_args, "entries");
+  const char *satconf   = http_arg_get(&hc->hc_req_args, "satconf");
   const char *id;
   htsmsg_field_t *f;
   th_dvb_mux_instance_t *tdmi;
+  dvb_satconf_t *sc = NULL;
 
   in = entries != NULL ? htsmsg_json_deserialize(entries) : NULL;
 
@@ -599,13 +651,20 @@ extjs_dvb_copymux(http_connection_t *hc, const char *remain, void *opaque)
     return 404;
   }
 
+  if (satconf) {
+    sc = dvb_satconf_entry_find(tda, satconf, 0);
+    if (sc == NULL) {
+      pthread_mutex_unlock(&global_lock);
+      return 404;
+    }
+  }
 
   TAILQ_FOREACH(f, &in->hm_fields, hmf_link) {
     if((id = htsmsg_field_get_string(f)) != NULL &&
        (tdmi = dvb_mux_find_by_identifier(id)) != NULL &&
        tda != tdmi->tdmi_adapter) {
 
-      if(dvb_mux_copy(tda, tdmi)) {
+      if(dvb_mux_copy(tda, tdmi, sc)) {
 	char buf[100];
 	dvb_mux_nicename(buf, sizeof(buf), tdmi);
 

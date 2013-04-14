@@ -27,6 +27,7 @@
 #include "dvb/dvb_support.h"
 #include "tsdemux.h"
 #include "parsers.h"
+#include "lang_codes.h"
 
 static int
 psi_section_reassemble0(psi_section_t *ps, const uint8_t *data, 
@@ -59,11 +60,11 @@ psi_section_reassemble0(psi_section_t *ps, const uint8_t *data,
   
   excess = ps->ps_offset - tsize;
 
-  if(crc && crc32(ps->ps_data, tsize, 0xffffffff))
+  if(crc && tvh_crc32(ps->ps_data, tsize, 0xffffffff))
     return -1;
 
-  cb(ps->ps_data, tsize - (crc ? 4 : 0), opaque);
   ps->ps_offset = 0;
+  cb(ps->ps_data, tsize - (crc ? 4 : 0), opaque);
   return len - excess;
 }
 
@@ -88,15 +89,15 @@ psi_section_reassemble(psi_section_t *ps, const uint8_t *tsb, int crc,
     int len = tsb[off++];
     if(len > 0) {
       if(len > 188 - off) {
-	ps->ps_lock = 0;
-	return;
+	      ps->ps_lock = 0;
+	      return;
       }
       psi_section_reassemble0(ps, tsb + off, len, 0, crc, cb, opaque);
       off += len;
     }
   }
 
-  while(off < 188 && tsb[off] != 0xff) {
+  while(off < 188) {
     r = psi_section_reassemble0(ps, tsb + off, 188 - off, pusi, crc,
 				cb, opaque);
     if(r < 0) {
@@ -106,44 +107,6 @@ psi_section_reassemble(psi_section_t *ps, const uint8_t *tsb, int crc,
     off += r;
     pusi = 0;
   }
-}
-
-
-/** 
- * PAT parser, from ISO 13818-1
- */
-int
-psi_parse_pat(service_t *t, uint8_t *ptr, int len,
-	      pid_section_callback_t *pmt_callback)
-{
-  uint16_t prognum;
-  uint16_t pid;
-  elementary_stream_t *st;
-
-  lock_assert(&t->s_stream_mutex);
-
-  if(len < 5)
-    return -1;
-
-  ptr += 5;
-  len -= 5;
-
-  while(len >= 4) {
-    
-    prognum =  ptr[0]         << 8 | ptr[1];
-    pid     = (ptr[2] & 0x1f) << 8 | ptr[3];
-
-    if(prognum != 0) {
-      if(service_stream_find(t, pid) == NULL) {
-	st = service_stream_create(t, pid, SCT_PMT);
-	st->es_section_docrc = 1;
-	st->es_got_section = pmt_callback;
-      }
-    }
-    ptr += 4;
-    len -= 4;
-  }
-  return 0;
 }
 
 
@@ -159,14 +122,14 @@ psi_append_crc32(uint8_t *buf, int offset, int maxlen)
   if(offset + 4 > maxlen)
     return -1;
 
-  crc = crc32(buf, offset, 0xffffffff);
+  crc = tvh_crc32(buf, offset, 0xffffffff);
 
   buf[offset + 0] = crc >> 24;
   buf[offset + 1] = crc >> 16;
   buf[offset + 2] = crc >> 8;
   buf[offset + 3] = crc;
 
-  assert(crc32(buf, offset + 4, 0xffffffff) == 0);
+  assert(tvh_crc32(buf, offset + 4, 0xffffffff) == 0);
 
   return offset + 4;
 }
@@ -307,8 +270,10 @@ psi_desc_ca(service_t *t, const uint8_t *buffer, int size)
     }
     break;
   case 0x4a00://DRECrypt
-    provid = size < 4 ? 0 : buffer[4];
-    break;
+    if (caid != 0x4aee) { // Bulcrypt
+      provid = size < 4 ? 0 : buffer[4];
+      break;
+    }
   default:
     provid = 0;
     break;
@@ -327,6 +292,7 @@ psi_desc_teletext(service_t *t, const uint8_t *ptr, int size,
 		  int parent_pid, int *position)
 {
   int r = 0;
+  const char *lang;
   elementary_stream_t *st;
 
   while(size >= 5) {
@@ -343,13 +309,14 @@ psi_desc_teletext(service_t *t, const uint8_t *ptr, int size,
       if((st = service_stream_find(t, pid)) == NULL) {
 	r |= PMT_UPDATE_NEW_STREAM;
 	st = service_stream_create(t, pid, SCT_TEXTSUB);
+	st->es_delete_me = 1;
       }
 
-      st->es_delete_me = 0;
-
-      if(memcmp(st->es_lang, ptr, 3)) {
-	r |= PMT_UPDATE_LANGUAGE;
-	memcpy(st->es_lang, ptr, 3);
+  
+      lang = lang_code_get2((const char*)ptr, 3);
+      if(memcmp(st->es_lang,lang,3)) {
+	      r |= PMT_UPDATE_LANGUAGE;
+        memcpy(st->es_lang, lang, 4);
       }
 
       if(st->es_parent_pid != parent_pid) {
@@ -357,10 +324,12 @@ psi_desc_teletext(service_t *t, const uint8_t *ptr, int size,
 	st->es_parent_pid = parent_pid;
       }
 
-      if(st->es_position != *position) {
+      // Check es_delete_me so we only compute position once per PMT update
+      if(st->es_position != *position && st->es_delete_me) {
 	st->es_position = *position;
 	r |= PMT_REORDERED;
       }
+      st->es_delete_me = 0;
       (*position)++;
     }
     ptr += 5;
@@ -420,7 +389,6 @@ psi_parse_pmt(service_t *t, const uint8_t *ptr, int len, int chksvcid,
   uint16_t sid;
   streaming_component_type_t hts_stream_type;
   elementary_stream_t *st, *next;
-  char lang[4];
   int update = 0;
   int had_components;
   int composition_id;
@@ -428,6 +396,7 @@ psi_parse_pmt(service_t *t, const uint8_t *ptr, int len, int chksvcid,
   int version;
   int position = 0;
   int tt_position = 1000;
+  const char *lang = NULL;
 
   caid_t *c, *cn;
 
@@ -463,6 +432,10 @@ psi_parse_pmt(service_t *t, const uint8_t *ptr, int len, int chksvcid,
   /* Mark all streams for deletion */
   if(delete) {
     TAILQ_FOREACH(st, &t->s_components, es_link) {
+
+      if(st->es_type == SCT_PMT)
+        continue;
+
       st->es_delete_me = 1;
 
       LIST_FOREACH(c, &st->es_caids, link)
@@ -501,7 +474,6 @@ psi_parse_pmt(service_t *t, const uint8_t *ptr, int len, int chksvcid,
     len -= 5;
 
     hts_stream_type = SCT_UNKNOWN;
-    memset(lang, 0, 4);
     composition_id = -1;
     ancillary_id = -1;
 
@@ -556,8 +528,8 @@ psi_parse_pmt(service_t *t, const uint8_t *ptr, int len, int chksvcid,
 	break;
 
       case DVB_DESC_LANGUAGE:
-	memcpy(lang, ptr, 3);
-	break;
+        lang = lang_code_get2((const char*)ptr, 3);
+	      break;
 
       case DVB_DESC_TELETEXT:
 	if(estype == 0x06)
@@ -579,14 +551,14 @@ psi_parse_pmt(service_t *t, const uint8_t *ptr, int len, int chksvcid,
 	break;
 
       case DVB_DESC_SUBTITLE:
-	if(dlen < 8)
-	  break;
+        if(dlen < 8)
+	        break;
 
-	memcpy(lang, ptr, 3);
-	composition_id = ptr[4] << 8 | ptr[5];
-	ancillary_id   = ptr[6] << 8 | ptr[7];
-	hts_stream_type = SCT_DVBSUB;
-	break;
+        lang = lang_code_get2((const char*)ptr, 3);
+        composition_id = ptr[4] << 8 | ptr[5];
+        ancillary_id   = ptr[6] << 8 | ptr[7];
+        hts_stream_type = SCT_DVBSUB;
+        break;
 
       case DVB_DESC_EAC3:
 	if(estype == 0x06 || estype == 0x81)
@@ -624,9 +596,9 @@ psi_parse_pmt(service_t *t, const uint8_t *ptr, int len, int chksvcid,
 	st->es_position = position;
       }
 
-      if(memcmp(st->es_lang, lang, 4)) {
-	update |= PMT_UPDATE_LANGUAGE;
-	memcpy(st->es_lang, lang, 4);
+      if(lang && memcmp(st->es_lang, lang, 3)) {
+        update |= PMT_UPDATE_LANGUAGE;
+        memcpy(st->es_lang, lang, 4);
       }
 
       if(composition_id != -1 && st->es_composition_id != composition_id) {
@@ -686,7 +658,7 @@ psi_parse_pmt(service_t *t, const uint8_t *ptr, int len, int chksvcid,
     service_request_save(t, 0);
 
     // Only restart if something that our clients worry about did change
-    if(update & !(PMT_UPDATE_NEW_CA_STREAM |
+    if(update & ~(PMT_UPDATE_NEW_CA_STREAM |
 		  PMT_UPDATE_NEW_CAID |
 		  PMT_UPDATE_CA_PROVIDER_CHANGE | 
 		  PMT_UPDATE_CAID_DELETED)) {
@@ -702,7 +674,8 @@ psi_parse_pmt(service_t *t, const uint8_t *ptr, int len, int chksvcid,
  * PMT generator
  */
 int
-psi_build_pmt(streaming_start_t *ss, uint8_t *buf0, int maxlen, int pcrpid)
+psi_build_pmt(const streaming_start_t *ss, uint8_t *buf0, int maxlen,
+	      int version, int pcrpid)
 {
   int c, tlen, dlen, l, i;
   uint8_t *buf, *buf1;
@@ -718,8 +691,10 @@ psi_build_pmt(streaming_start_t *ss, uint8_t *buf0, int maxlen, int pcrpid)
   buf[4] = 0x01;
 
   buf[5] = 0xc1; /* current_next_indicator + version */
-  buf[6] = 0;
-  buf[7] = 0;
+  buf[5] |= (version & 0x1F) << 1;
+
+  buf[6] = 0; /* section number */
+  buf[7] = 0; /* last section number */
 
   buf[8] = 0xe0 | (pcrpid >> 8);
   buf[9] =         pcrpid;
@@ -731,7 +706,7 @@ psi_build_pmt(streaming_start_t *ss, uint8_t *buf0, int maxlen, int pcrpid)
   tlen = 12;
 
   for(i = 0; i < ss->ss_num_components; i++) {
-    streaming_start_component_t *ssc = &ss->ss_components[i];
+    const streaming_start_component_t *ssc = &ss->ss_components[i];
 
     switch(ssc->ssc_type) {
     case SCT_MPEG2VIDEO:
@@ -742,6 +717,7 @@ psi_build_pmt(streaming_start_t *ss, uint8_t *buf0, int maxlen, int pcrpid)
       c = 0x04;
       break;
 
+    case SCT_EAC3:
     case SCT_DVBSUB:
       c = 0x06;
       break;
@@ -804,6 +780,16 @@ psi_build_pmt(streaming_start_t *ss, uint8_t *buf0, int maxlen, int pcrpid)
       buf[8] = 0; /* XXX: generate real AC3 desc */
       dlen = 9;
       break;
+    case SCT_EAC3:
+      buf[0] = DVB_DESC_LANGUAGE;
+      buf[1] = 4;
+      memcpy(&buf[2],ssc->ssc_lang,3);
+      buf[5] = 0; /* Main audio */
+      buf[6] = DVB_DESC_EAC3;
+      buf[7] = 1;
+      buf[8] = 0; /* XXX: generate real EAC3 desc */
+      dlen = 9;
+      break;
     default:
       break;
     }
@@ -833,15 +819,40 @@ static struct strtab caidnametab[] = {
   { "Viaccess",         0x0500 }, 
   { "Irdeto",           0x0600 }, 
   { "Irdeto",           0x0602 }, 
-  { "Irdeto",           0x0604 }, 
+  { "Irdeto",           0x0603 },
+  { "Irdeto",           0x0604 },
+  { "Irdeto",		0x0622 },
+  { "Irdeto",		0x0624 },
+  { "Irdeto",		0x0648 },
+  { "Irdeto",		0x0666 },
   { "Jerroldgi",        0x0700 }, 
   { "Matra",            0x0800 }, 
-  { "NDS",              0x0900 }, 
+  { "NDS",              0x0900 },
+  { "NDS",              0x0919 },
+  { "NDS",              0x091F }, 
+  { "NDS",              0x092B },
+  { "NDS",              0x09AF }, 
+  { "NDS",              0x09C4 },
+  { "NDS",              0x0960 },
+  { "NDS",              0x0963 }, 
   { "Nokia",            0x0A00 }, 
-  { "Conax",            0x0B00 }, 
+  { "Conax",            0x0B00 },
+  { "Conax",            0x0B01 },
+  { "Conax",            0x0B02 }, 
+  { "Conax",            0x0BAA },
   { "NTL",              0x0C00 }, 
-  { "CryptoWorks",      0x0D00 }, 
+  { "CryptoWorks",	0x0D00 },
+  { "CryptoWorks",	0x0D01 },
+  { "CryptoWorks",	0x0D02 },
+  { "CryptoWorks",	0x0D03 },
+  { "CryptoWorks",	0x0D05 },
+  { "CryptoWorks",	0x0D0F },
+  { "CryptoWorks",	0x0D70 },
+  { "CryptoWorks ICE",	0x0D95 }, 
+  { "CryptoWorks ICE",	0x0D96 },
+  { "CryptoWorks ICE",	0x0D97 },
   { "PowerVu",          0x0E00 }, 
+  { "PowerVu",          0x0E11 }, 
   { "Sony",             0x0F00 }, 
   { "Tandberg",         0x1000 }, 
   { "Thompson",         0x1100 }, 
@@ -854,7 +865,16 @@ static struct strtab caidnametab[] = {
   { "BetaCrypt",        0x1702 }, 
   { "BetaCrypt",        0x1722 }, 
   { "BetaCrypt",        0x1762 }, 
-  { "NagraVision",      0x1800 }, 
+  { "NagraVision",      0x1800 },
+  { "NagraVision",      0x1803 },
+  { "Nagra Media Access",      0x1813 },
+  { "NagraVision",      0x1810 },
+  { "NagraVision",      0x1815 },
+  { "NagraVision",      0x1830 },
+  { "NagraVision",      0x1833 },
+  { "NagraVision",      0x1834 },
+  { "NagraVision",      0x183D },
+  { "NagraVision",      0x1861 },
   { "Titan",            0x1900 }, 
   { "Telefonica",       0x2000 }, 
   { "Stentor",          0x2100 }, 
@@ -866,7 +886,10 @@ static struct strtab caidnametab[] = {
   { "GI",               0x4700 }, 
   { "Telemann",         0x4800 },
   { "DRECrypt",         0x4ae0 },
-  { "DRECrypt2",        0x4ae1 }
+  { "DRECrypt2",        0x4ae1 },
+  { "Bulcrypt",         0x4aee },
+  { "Bulcrypt",         0x5581 },
+  { "Verimatrix",       0x5601 },
 };
 
 const char *
@@ -893,7 +916,6 @@ static struct strtab streamtypetab[] = {
   { "DVBSUB",     SCT_DVBSUB },
   { "CA",         SCT_CA },
   { "PMT",        SCT_PMT },
-  { "PAT",        SCT_PAT },
   { "AAC",        SCT_AAC },
   { "MPEGTS",     SCT_MPEGTS },
   { "TEXTSUB",    SCT_TEXTSUB },
@@ -967,6 +989,8 @@ psi_save_service_settings(htsmsg_t *m, service_t *t)
 	htsmsg_add_u32(sub, "width", st->es_width);
 	htsmsg_add_u32(sub, "height", st->es_height);
       }
+      if(st->es_frame_duration)
+        htsmsg_add_u32(sub, "duration", st->es_frame_duration);
     }
     
     htsmsg_add_msg(m, "stream", sub);
@@ -1083,7 +1107,7 @@ psi_load_service_settings(htsmsg_t *m, service_t *t)
     st = service_stream_create(t, pid, type);
     
     if((v = htsmsg_get_str(c, "language")) != NULL)
-      snprintf(st->es_lang, 4, "%s", v);
+      strncpy(st->es_lang, lang_code_get(v), 3);
 
     if(!htsmsg_get_u32(c, "position", &u32))
       st->es_position = u32;
@@ -1110,6 +1134,9 @@ psi_load_service_settings(htsmsg_t *m, service_t *t)
 
       if(!htsmsg_get_u32(c, "height", &u32))
 	st->es_height = u32;
+
+      if(!htsmsg_get_u32(c, "duration", &u32))
+        st->es_frame_duration = u32;
     }
 
   }

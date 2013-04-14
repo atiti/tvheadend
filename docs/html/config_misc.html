@@ -1,0 +1,50 @@
+<div class="hts-doc-text">
+
+ <p>
+ This tabs allow configuration of several general parameters that affect the
+ core TVH functionality.
+ </p>
+
+ <dl>
+  <dt>Default Language(s)
+  <dd>
+  Select the list of languages (in order of priority) to be used for supplying
+  EPG information to clients that don't provide their own configuration.
+  <p>
+  The EPG information is NOT translated, this only applies to EPG providers
+  that give information (titles, descriptions, etc..) in multiple languages.
+
+  <dt>DVB scan files path:
+  <dd>
+  Select the path to use for DVB scan configuration files. Typically
+  dvb-apps stores these in /usr/share/dvb/. Leave blank to use TVH's internal
+  file set.
+ </dl>
+
+ <p>
+ Icon caching - this will cache any channel icons or other images (such as
+ EPG metadata). These will then be served from the local webserver, this
+ can be useful for multi-client systems and generally to reduce hits on
+ upstream providers.
+ </p>
+
+ <dl>
+
+  <dt>Enabled
+  <dd>
+  Select whether or not to enable caching. Note: even with this disabled
+  you can still specify local (file://) icons and these will be served by
+  the built-in webserver.
+  
+  <dt>Re-fetch period (hours)
+  <dd>
+  How frequently the upstream provider is checked for changes.
+  
+  <dt>Re-try period (hours)
+  <dd>
+  How frequently it will re-try fetching an image that has failed to be
+  fetched.
+ </dl>
+
+ </dl>  
+</div>
