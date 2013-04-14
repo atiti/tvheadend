@@ -48,6 +48,73 @@ struct v4l_adapter_queue v4l_adapters;
 
 static void v4l_adapter_notify(v4l_adapter_t *va);
 
+#if defined(ENABLE_LIBAVCODEC) && defined(ENABLE_LIBAVFORMAT)
+#define STREAM_FRAME_RATE 25
+/* 
+ * add an audio output stream
+ */
+AVStream *add_audio_stream(AVFormatContext *oc, int codec_id) {
+    AVCodecContext *c;
+    AVStream *st;
+
+    st = av_new_stream(oc, 1);
+    if (!st) {
+        fprintf(stderr, "Could not alloc stream\n");
+        exit(1);
+    }
+
+    c = &st->codec;
+    c->codec_id = codec_id;
+    c->codec_type = CODEC_TYPE_AUDIO;
+
+    /* put sample parameters */
+    c->bit_rate = 64000;
+    c->sample_rate = 44100;
+    c->channels = 2;
+    return st;
+}
+
+/* add a video output stream */
+AVStream *add_video_stream(AVFormatContext *oc, int codec_id) {
+    AVCodecContext *c;
+    AVStream *st;
+
+    st = av_new_stream(oc, 0);
+    if (!st) {
+        fprintf(stderr, "Could not alloc stream\n");
+        exit(1);
+    }
+    
+    c = &st->codec;
+    c->codec_id = codec_id;
+    c->codec_type = CODEC_TYPE_VIDEO;
+
+    /* put sample parameters */
+    c->bit_rate = 40000;
+    /* resolution must be a multiple of two */
+    c->width = 640;  
+    c->height = 480;
+    /* frames per second */
+    c->frame_rate = STREAM_FRAME_RATE;  
+    c->frame_rate_base = 1;
+    c->gop_size = 12; /* emit one intra frame every twelve frames at most */
+    if (c->codec_id == CODEC_ID_MPEG2VIDEO) {
+        /* just for testing, we also add B frames */
+        c->max_b_frames = 2;
+    }
+    if (c->codec_id == CODEC_ID_MPEG1VIDEO){
+        /* needed to avoid using macroblocks in which some coeffs overflow 
+           this doesnt happen with normal video, it just happens here as the 
+           motion of the chroma plane doesnt match the luma plane */
+        c->mb_decision=2;
+    }
+    // some formats want stream headers to be seperate
+    if(!strcmp(oc->oformat->name, "mp4") || !strcmp(oc->oformat->name, "mov") || !strcmp(oc->oformat->name, "3gp"))
+        c->flags |= CODEC_FLAG_GLOBAL_HEADER;
+    
+    return st;
+}
+#endif
 
 static int xioctl(int fd, int request, void* argp)
 {
@@ -124,10 +191,27 @@ v4l_input(v4l_adapter_t *va)
   }
 
   tvhlog(LOG_DEBUG, "v4l", "Read %d bytes", len);
-  goto theend;
 
+#ifdef ENABLE_LIBAVCODEC
+  int outbuf_size = 100000;
+  uint8_t *outbuf;
+  outbuf = malloc(outbuf_size);
+  int size = va->width * va->height;
+  va->picture->data[0] = buf;
+  va->picture->data[1] = va->picture->data[0] + size;
+  va->picture->data[2] = va->picture->data[1] + size / 4;
+  va->picture->linesize[0] = va->width;
+  va->picture->linesize[1] = va->width / 2;
+  va->picture->linesize[2] = va->width / 2;
 
+  int out_size = avcodec_encode_video(va->c, outbuf, outbuf_size, va->picture);
+  tvhlog(LOG_DEBUG, "v4l", "Encoded frame %d", out_size);
+  ptr = outbuf;
+#else
   ptr = buf;
+#endif
+  //goto theend;
+  //ptr = buf;
 
   pthread_mutex_lock(&t->s_stream_mutex);
 
@@ -189,7 +273,7 @@ v4l_input(v4l_adapter_t *va)
   }
 
   pthread_mutex_unlock(&t->s_stream_mutex);
-theend:
+//theend:
   switch(va->io) {
 	case IO_METHOD_READ:
 		free(buf);
@@ -269,8 +353,9 @@ v4l_service_start(service_t *t, unsigned int weight, int force_start)
   v4l2_std_id std = 0xff;
   int fd,min;
   char buff[10];
-  int width=640,height=480;
-
+ 
+  va->width=640;
+  va->height=480;
   va->io = IO_METHOD_MMAP;
 
   if(va->va_current_service != NULL)
@@ -320,21 +405,21 @@ v4l_service_start(service_t *t, unsigned int weight, int force_start)
   if (!va->va_can_mpeg) {
     CLEAR(fmt);
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    fmt.fmt.pix.width = width;
-    fmt.fmt.pix.height = height;
+    fmt.fmt.pix.width = va->width;
+    fmt.fmt.pix.height = va->height;
     fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
     fmt.fmt.pix.field = V4L2_FIELD_INTERLACED;
 
     if (-1 == xioctl(fd, VIDIOC_S_FMT, &fmt)) {
        tvhlog(LOG_ERR, "v4l", "Unable to set format to YUYV");
     }
-    if (width != fmt.fmt.pix.width) {
-	width = fmt.fmt.pix.width;
-	tvhlog(LOG_WARNING, "v4l", "Image width set to %d by device", width);
+    if (va->width != fmt.fmt.pix.width) {
+	va->width = fmt.fmt.pix.width;
+	tvhlog(LOG_WARNING, "v4l", "Image width set to %d by device", va->width);
     }
-    if (height != fmt.fmt.pix.height) {
- 	height = fmt.fmt.pix.height;
-	tvhlog(LOG_WARNING, "v4l", "Image height set to %d by device", height);
+    if (va->height != fmt.fmt.pix.height) {
+ 	va->height = fmt.fmt.pix.height;
+	tvhlog(LOG_WARNING, "v4l", "Image height set to %d by device", va->height);
     }
     /* buggy driver paranoia */
     min = fmt.fmt.pix.width * 2;
@@ -345,6 +430,39 @@ v4l_service_start(service_t *t, unsigned int weight, int force_start)
    	fmt.fmt.pix.sizeimage = min;
     va->va_frame_size = fmt.fmt.pix.sizeimage;
 
+#ifdef ENABLE_LIBAVCODEC
+    va->codec = NULL;
+    va->c = NULL;
+  
+    avcodec_init();
+    avcodec_register_all();
+
+    //va->fmt = 
+    va->oc = av_alloc_format_context();
+
+    va->codec = avcodec_find_encoder(CODEC_ID_MPEG2VIDEO);
+    if (!va->codec) {
+	tvhlog(LOG_ERR, "v4l", "Failed to initialize mpeg2 encoder");
+	close(fd);
+	return -1;
+    }
+
+    va->c = avcodec_alloc_context();
+    va->picture = avcodec_alloc_frame();
+    va->c->bit_rate = 40000; // Bitrate
+    va->c->width = va->width;
+    va->c->height = va->height;
+    va->c->time_base = (AVRational){1,25};
+    va->c->gop_size = 10;
+    va->c->max_b_frames = 1;
+    va->c->pix_fmt = PIX_FMT_YUV420P;
+
+    if (avcodec_open(va->c, va->codec) < 0) {
+	tvhlog(LOG_ERR, "v4l", "Failed to open codec");
+	close(fd);
+	return -1;
+    }
+#endif
     int index = 0;
     if (-1 == xioctl(fd, VIDIOC_S_INPUT, &index)) {
 	tvhlog(LOG_ERR, "v4l", "Failed to set input to 0");
@@ -435,7 +553,6 @@ v4l_service_start(service_t *t, unsigned int weight, int force_start)
     result = read(fd, buff, 0);
 	
   }
-
 
   va->va_fd = fd;
   va->va_current_service = t;

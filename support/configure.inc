@@ -28,6 +28,7 @@ CONFIG_LIST="
  v4l
  execinfo
  libavcodec
+ libavformat
 "
 
 die() {

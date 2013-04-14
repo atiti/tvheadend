@@ -164,6 +164,15 @@ else
    die
 fi
 
+if pkg-config libavformat; then
+   echo >>${CONFIG_MAK} "LDFLAGS_cfg += " `pkg-config --libs libavformat`
+   echo >>${CONFIG_MAK} "CFLAGS_cfg += " `pkg-config --cflags libavformat`
+   echo "Using libavformat:      `pkg-config --modversion libavformat`"
+   enable libavformat
+else
+   echo "libavformat not found"
+   die
+fi
 
 #
 # Configure paths, etc

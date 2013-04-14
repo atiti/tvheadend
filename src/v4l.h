@@ -22,6 +22,11 @@
 #define __user
 #include <linux/videodev2.h>
 
+#if defined(ENABLE_LIBAVCODEC) && defined(ENABLE_LIBAVFORMAT) 
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#endif
+
 
 typedef enum {
         IO_METHOD_READ,
@@ -65,6 +70,22 @@ typedef struct v4l_adapter {
   struct buffer *buffers;
  
   io_method io;
+
+  int width;
+  int height;
+
+#ifdef ENABLE_LIBAVCODEC
+  AVCodec *codec;
+  AVCodecContext *c;
+  AVFrame *picture;
+  uint8_t *picture_buf;
+  AVOutputFormat *fmt;
+  AVFormatContext *oc;
+  AVStream *audio_st, *video_st;
+  double audio_pts, video_pts;
+
+#endif
+
 
   //  struct v4l2_capability va_caps;
 
